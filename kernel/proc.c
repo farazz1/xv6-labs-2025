@@ -688,3 +688,24 @@ procdump(void)
     printf("\n");
   }
 }
+
+// Helper function to get process info by PID
+int
+getprocinfo(int pid, struct procinfo *info)
+{
+  struct proc *p;
+  
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->pid == pid) {
+      info->pid = p->pid;
+      info->state = p->state;
+      info->size = (int)p->sz;  // Cast to int
+      safestrcpy(info->name, p->name, sizeof(info->name));
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}

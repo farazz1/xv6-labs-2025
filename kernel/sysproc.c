@@ -107,3 +107,26 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+
+uint64
+sys_getprocinfo(void)
+{
+  uint64 uaddr;
+  int pid;
+  struct procinfo info;
+
+  // Get arguments - these functions set the variables directly
+  argaddr(0, &uaddr);
+  argint(1, &pid);
+
+  // Use our helper function from proc.c
+  if(getprocinfo(pid, &info) < 0)
+    return -1;
+
+  // Copy to user space
+  if(copyout(myproc()->pagetable, uaddr, (char *)&info, sizeof(info)) < 0)
+    return -1;
+    
+  return 0;
+}
