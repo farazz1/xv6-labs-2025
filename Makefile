@@ -143,6 +143,12 @@ UPROGS=\
 	$U/_logstress\
 	$U/_forphan\
 	$U/_dorphan\
+        $U/_cpu_hog\
+        $U/_io_bound\
+        $U/_mixed_workload\
+        $U/_mlfq_monitor\
+        $U/_priority_test\
+        $U/_simple_test\
         $U/_testprocinfo
 
 fs.img: mkfs/mkfs README $(UPROGS)

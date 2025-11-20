@@ -104,4 +104,10 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+ // MLFQ scheduling fields
+    int priority;           // Current queue level (0-3)
+    int ticks_in_queue;     // Ticks spent in current queue
+    int time_slice_used;    // Ticks used in current time slice
+    int last_run_tick;      // Last tick when process ran
 };

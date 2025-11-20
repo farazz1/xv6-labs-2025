@@ -6,6 +6,20 @@
 #include "proc.h"
 #include "defs.h"
 
+#define NQUEUES 4
+
+struct mlfq_queue {
+    struct proc* processes[NPROC];
+    int front;
+    int rear;
+    int count;
+};
+
+struct {
+    struct spinlock lock;
+    struct mlfq_queue queues[NQUEUES];
+} mlfq;
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -25,6 +39,68 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+// MLFQ Functions - SIMPLIFIED VERSION
+void mlfq_init(void) {
+    initlock(&mlfq.lock, "mlfq");
+    for (int i = 0; i < NQUEUES; i++) {
+        mlfq.queues[i].front = 0;
+        mlfq.queues[i].rear = 0;
+        mlfq.queues[i].count = 0;
+    }
+}
+
+void mlfq_enqueue(struct proc* p, int queue_level) {
+    acquire(&mlfq.lock);
+    
+    if (queue_level < 0 || queue_level >= NQUEUES) {
+        release(&mlfq.lock);
+        return;
+    }
+    
+    struct mlfq_queue* q = &mlfq.queues[queue_level];
+    
+    if (q->count < NPROC) {
+        q->processes[q->rear] = p;
+        q->rear = (q->rear + 1) % NPROC;
+        q->count++;
+        p->priority = queue_level;
+    }
+    
+    release(&mlfq.lock);
+}
+
+struct proc* mlfq_dequeue(int queue_level) {
+    acquire(&mlfq.lock);
+    
+    if (queue_level < 0 || queue_level >= NQUEUES) {
+        release(&mlfq.lock);
+        return 0;
+    }
+    
+    struct mlfq_queue* q = &mlfq.queues[queue_level];
+    struct proc* p = 0;
+    
+    if (q->count > 0) {
+        p = q->processes[q->front];
+        q->front = (q->front + 1) % NPROC;
+        q->count--;
+    }
+    
+    release(&mlfq.lock);
+    return p;
+}
+
+int mlfq_is_empty(int queue_level) {
+    acquire(&mlfq.lock);
+    int empty = (mlfq.queues[queue_level].count == 0);
+    release(&mlfq.lock);
+    return empty;
+}
+
+void mlfq_handle_boosting(void) {
+    // Simplified - no boosting for now
+}
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -146,6 +222,9 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // MLFQ initialization
+  p->priority = 0;
+
   return p;
 }
 
@@ -169,6 +248,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->priority = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -223,6 +303,12 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
+  
+  // Initialize MLFQ
+  mlfq_init();
+  
+  // Add initial process to MLFQ
+  mlfq_enqueue(p, 0);
   
   p->cwd = namei("/");
 
@@ -300,6 +386,10 @@ kfork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  
+  // Add new process to MLFQ (starts in highest priority)
+  mlfq_enqueue(np, 0);
+  
   release(&np->lock);
 
   return pid;
@@ -426,38 +516,55 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-
+  
   c->proc = 0;
+  
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
+    // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
-    intr_off();
-
+    
     int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
+    
+    // Check each queue from highest to lowest priority
+    for(int queue = 0; queue < NQUEUES; queue++) {
+        if(!mlfq_is_empty(queue)) {
+            p = mlfq_dequeue(queue);
+            if(p) {
+                // Switch to chosen process
+                acquire(&p->lock);
+                if(p->state == RUNNABLE) {
+                    found = 1;
+                    
+                    // Set process state
+                    p->state = RUNNING;
+                    c->proc = p;
+                    
+                    // Switch to process
+                    swtch(&c->context, &p->context);
+                    
+                    // Process is done running for now
+                    c->proc = 0;
+                    
+                    // Handle MLFQ scheduling logic - SIMPLIFIED
+                    if(p->state == RUNNABLE) {
+                        // Always re-enqueue in same queue for now
+                        mlfq_enqueue(p, queue);
+                    }
+                    // If process terminated or sleeping, don't re-enqueue
+                }
+                release(&p->lock);
+                
+                if(found) break;
+            }
+        }
     }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
+    
+    if(!found) {
+        // Handle priority boosting
+        mlfq_handle_boosting();
+        
+        intr_on();
+        asm volatile("wfi");
     }
   }
 }
@@ -580,6 +687,8 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        // When waking up, add back to MLFQ
+        mlfq_enqueue(p, p->priority);
       }
       release(&p->lock);
     }
@@ -601,6 +710,7 @@ kkill(int pid)
       if(p->state == SLEEPING){
         // Wake process from sleep().
         p->state = RUNNABLE;
+        mlfq_enqueue(p, p->priority);
       }
       release(&p->lock);
       return 0;
