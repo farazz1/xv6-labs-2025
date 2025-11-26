@@ -130,3 +130,15 @@ sys_getprocinfo(void)
     
   return 0;
 }
+
+uint64
+sys_boostproc(void)
+{
+    int pid;
+    
+    // Get the PID argument
+    argint(0, &pid);
+    
+    // Use the helper function from proc.c
+    return boost_process(pid);
+}

@@ -7,6 +7,8 @@
 #include "defs.h"
 
 #define NQUEUES 4
+#define TIME_QUANTUM {1, 2, 4, 8}  // Time slices for each queue
+#define BOOST_INTERVAL 1000        // Boost all processes every 1000 ticks
 
 struct mlfq_queue {
     struct proc* processes[NPROC];
@@ -18,6 +20,8 @@ struct mlfq_queue {
 struct {
     struct spinlock lock;
     struct mlfq_queue queues[NQUEUES];
+    int time_quantum[NQUEUES];    // Time quantums for each queue
+    int boost_timer;              // Timer for priority boosting
 } mlfq;
 
 struct cpu cpus[NCPU];
@@ -40,14 +44,20 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
-// MLFQ Functions - SIMPLIFIED VERSION
+// MLFQ Functions - UPDATED FOR WEEK 3
 void mlfq_init(void) {
     initlock(&mlfq.lock, "mlfq");
+    
+    // Initialize time quantums
+    int default_quantum[NQUEUES] = {1, 2, 4, 8};
     for (int i = 0; i < NQUEUES; i++) {
+        mlfq.time_quantum[i] = default_quantum[i];
         mlfq.queues[i].front = 0;
         mlfq.queues[i].rear = 0;
         mlfq.queues[i].count = 0;
     }
+    
+    mlfq.boost_timer = 0;
 }
 
 void mlfq_enqueue(struct proc* p, int queue_level) {
@@ -64,7 +74,11 @@ void mlfq_enqueue(struct proc* p, int queue_level) {
         q->processes[q->rear] = p;
         q->rear = (q->rear + 1) % NPROC;
         q->count++;
+        
+        // Update process priority and reset time tracking
         p->priority = queue_level;
+        p->time_slice_used = 0;
+        p->ticks_in_queue = 0;
     }
     
     release(&mlfq.lock);
@@ -98,8 +112,53 @@ int mlfq_is_empty(int queue_level) {
     return empty;
 }
 
+// IMPROVED: Priority boosting function
+void mlfq_boost_all(void) {
+    printf("MLFQ: Priority boost triggered!\n");
+    
+    struct proc *p;
+    
+    // Boost all RUNNABLE processes to queue 0
+    for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && p->priority > 0) {
+            // Only boost processes that are not already in queue 0
+            printf("MLFQ: Boosting PID %d from Q%d to Q0\n", p->pid, p->priority);
+            mlfq_enqueue(p, 0);
+        }
+        release(&p->lock);
+    }
+    
+    // Also handle processes that might be in lower queues but not RUNNABLE
+    // Clear all lower queues to prevent stale processes
+    acquire(&mlfq.lock);
+    for(int queue = 1; queue < NQUEUES; queue++) {
+        while(mlfq.queues[queue].count > 0) {
+            struct proc* stale_proc = mlfq_dequeue(queue);
+            if(stale_proc) {
+                // If we find a stale process, enqueue it properly
+                acquire(&stale_proc->lock);
+                if(stale_proc->state == RUNNABLE) {
+                    mlfq_enqueue(stale_proc, 0);
+                }
+                release(&stale_proc->lock);
+            }
+        }
+    }
+    mlfq.boost_timer = 0;
+    release(&mlfq.lock);
+}
+
+// SIMPLER: Boosting handler
 void mlfq_handle_boosting(void) {
-    // Simplified - no boosting for now
+    acquire(&mlfq.lock);
+    mlfq.boost_timer++;
+    if(mlfq.boost_timer >= BOOST_INTERVAL) {
+        release(&mlfq.lock);
+        mlfq_boost_all();
+    } else {
+        release(&mlfq.lock);
+    }
 }
 
 // Allocate a page for each process's kernel stack.
@@ -222,8 +281,10 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
-  // MLFQ initialization
+  // MLFQ initialization - UPDATED FOR WEEK 3
   p->priority = 0;
+  p->time_slice_used = 0;
+  p->ticks_in_queue = 0;
 
   return p;
 }
@@ -249,6 +310,8 @@ freeproc(struct proc *p)
   p->xstate = 0;
   p->state = UNUSED;
   p->priority = 0;
+  p->time_slice_used = 0;
+  p->ticks_in_queue = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -389,7 +452,6 @@ kfork(void)
   
   // Add new process to MLFQ (starts in highest priority)
   mlfq_enqueue(np, 0);
-  
   release(&np->lock);
 
   return pid;
@@ -545,10 +607,17 @@ scheduler(void)
                     // Process is done running for now
                     c->proc = 0;
                     
-                    // Handle MLFQ scheduling logic - SIMPLIFIED
+                    // Handle MLFQ scheduling logic - UPDATED FOR WEEK 3
                     if(p->state == RUNNABLE) {
-                        // Always re-enqueue in same queue for now
-                        mlfq_enqueue(p, queue);
+                        // Process used its time slice - demote
+                        if(p->time_slice_used >= mlfq.time_quantum[queue]) {
+                            int new_queue = (queue < NQUEUES - 1) ? queue + 1 : queue;
+                            mlfq_enqueue(p, new_queue);
+                            printf("MLFQ: PID %d demoted from Q%d to Q%d\n", p->pid, queue, new_queue);
+                        } else {
+                            // Process yielded early - keep in same queue
+                            mlfq_enqueue(p, queue);
+                        }
                     }
                     // If process terminated or sleeping, don't re-enqueue
                 }
@@ -603,6 +672,10 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+  
+  // Update time slice used for MLFQ
+ // p->time_slice_used = 0;
+  
   sched();
   release(&p->lock);
 }
@@ -818,4 +891,27 @@ getprocinfo(int pid, struct procinfo *info)
     release(&p->lock);
   }
   return -1;
+}
+
+// Helper function to boost a process by PID
+int
+boost_process(int pid)
+{
+    struct proc *p;
+    
+    for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->pid == pid) {
+            // Found the process - boost it to queue 0
+            if(p->state == RUNNABLE) {
+                mlfq_enqueue(p, 0);
+                printf("MLFQ: Manually boosted PID %d to Q0\n", pid);
+            }
+            release(&p->lock);
+            return 0;
+        }
+        release(&p->lock);
+    }
+    
+    return -1; // Process not found
 }

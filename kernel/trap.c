@@ -76,7 +76,14 @@ usertrap(void)
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
   }
-
+if(which_dev == 2) {
+    struct proc *p = myproc();
+    if(p && p->state == RUNNING) {
+        p->time_slice_used++;
+        p->ticks_in_queue++;
+        // Minimal debug for test processes:
+    }
+}
   if(killed(p))
     kexit(-1);
 

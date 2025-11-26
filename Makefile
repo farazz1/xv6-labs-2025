@@ -149,6 +149,10 @@ UPROGS=\
         $U/_mlfq_monitor\
         $U/_priority_test\
         $U/_simple_test\
+        $U/_long_test\
+        $U/_final_test\
+        $U/_boostproc\
+        $U/_sleep_test\
         $U/_testprocinfo
 
 fs.img: mkfs/mkfs README $(UPROGS)
